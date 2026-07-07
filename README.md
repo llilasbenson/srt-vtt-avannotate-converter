@@ -1,1 +1,0 @@
-# srt-vtt-avannotate-converter
