@@ -13,12 +13,12 @@ from typing import Any, Callable, Iterable, Optional
 import streamlit as st
 
 
-st.set_page_config(page_title="SRT to TSV Converter v5", page_icon="📝", layout="wide")
+st.set_page_config(page_title="SRT to TSV Converter v7", page_icon="📝", layout="wide")
 
 
 # ---------- Configuration ----------
 
-APP_VERSION = "5.0"
+APP_VERSION = "7.0"
 
 # Language-specific spaCy pipelines used for named-entity recognition.
 # The requirements file installs the small pipelines. The loader also accepts
@@ -89,8 +89,9 @@ Our first speaker is Ana Silva.
             "spaCy identifies people, organizations, and locations. Person names are inverted "
             "heuristically to Family name, Given name. One-word entities are preserved when "
             "they are nouns or proper nouns—including countries and place names—but detections "
-            "tagged as verbs, auxiliary verbs, or adjectives are excluded. NER results and "
-            "geographic matches should be reviewed."
+            "tagged as verbs, auxiliary verbs, or adjectives are excluded. For place names, "
+            "leading prepositions and any verb tokens included in the detected span are removed. "
+            "NER results and geographic matches should be reviewed."
         ),
         "resolve_places": "Resolve place names to geographic hierarchies",
         "resolve_places_help": (
@@ -180,7 +181,9 @@ Nuestra primera ponente es Ana Silva.
             "invierten de manera heurística a Apellido, Nombre. Se conservan las entidades de una "
             "sola palabra cuando son sustantivos o nombres propios, incluidos países y lugares, "
             "pero se excluyen las detecciones etiquetadas como verbos, verbos auxiliares o "
-            "adjetivos. Se deben revisar los resultados y las coincidencias geográficas."
+            "adjetivos. En los nombres de lugar se eliminan las preposiciones iniciales y cualquier "
+            "verbo incluido dentro del segmento detectado. Se deben revisar los resultados y las "
+            "coincidencias geográficas."
         ),
         "resolve_places": "Resolver los lugares como jerarquías geográficas",
         "resolve_places_help": (
@@ -270,7 +273,9 @@ Nossa primeira palestrante é Ana Silva.
             "invertidos de forma heurística para Sobrenome, Nome. Entidades de uma única palavra "
             "são preservadas quando são substantivos ou nomes próprios, incluindo países e "
             "lugares, mas detecções marcadas como verbos, verbos auxiliares ou adjetivos são "
-            "excluídas. Os resultados e as correspondências geográficas devem ser revisados."
+            "excluídas. Nos nomes de lugar, preposições iniciais e quaisquer verbos incluídos no "
+            "trecho detectado são removidos. Os resultados e as correspondências geográficas "
+            "devem ser revisados."
         ),
         "resolve_places": "Resolver lugares como hierarquias geográficas",
         "resolve_places_help": (
@@ -396,6 +401,21 @@ ADMINISTRATIVE_PLACE_PATTERN = re.compile(
     r"diocese|arquidiocese)\b",
     re.IGNORECASE,
 )
+
+# Lexical fallback for leading prepositions when a language model does not assign
+# the expected ADP part-of-speech tag. POS tagging remains the primary test.
+LEADING_LOCATION_PREPOSITIONS = {
+    # English
+    "at", "by", "from", "in", "into", "near", "of", "on", "to", "toward", "towards",
+    # Spanish
+    "a", "al", "ante", "bajo", "cabe", "con", "contra", "de", "del", "desde", "en",
+    "entre", "hacia", "hasta", "para", "por", "según", "sin", "sobre", "tras",
+    # Portuguese
+    "à", "ao", "aos", "às", "da", "das", "de", "do", "dos", "em", "na", "nas",
+    "no", "nos", "para", "pela", "pelas", "pelo", "pelos", "por", "sob", "sobre",
+}
+
+LOCATION_VERB_POS = {"VERB", "AUX"}
 
 
 LocationResolver = Callable[[str, str], str]
@@ -729,7 +749,7 @@ def load_ner_model(language_code: str) -> tuple[Any, str, bool]:
             load_errors.append(f"{model_name}: {error}")
 
     # requirements.txt should normally install the preferred small model before
-    # Streamlit starts. This fallback helps when only app_v5.py was copied into a
+    # Streamlit starts. This fallback helps when only app_v7.py was copied into a
     # deployment or when the model dependency was accidentally omitted.
     preferred_model = SPACY_MODEL_IDS[language_code]
     try:
@@ -832,6 +852,80 @@ def entity_word_tokens(entity: Any) -> list[Any]:
     ]
 
 
+def clean_place_entity(entity: Any) -> str:
+    """Clean a spaCy location span without discarding legitimate one-word places.
+
+    Rules:
+    - Remove prepositions only when they occur at the beginning of the detected span.
+    - Remove any tokens spaCy tags as VERB or AUX, wherever they occur in the span.
+    - Preserve the remaining punctuation and spacing as closely as possible.
+    - Return an empty string when cleanup leaves no substantive place-name token.
+
+    Examples:
+        "en México" -> "México"
+        "de Nueva York" -> "Nueva York"
+        "visitó Madrid" (if wholly tagged as LOC) -> "Madrid"
+    """
+    tokens = [token for token in entity if not token.is_space and token.text.strip()]
+    if not tokens:
+        return ""
+
+    # Remove opening punctuation before evaluating the first lexical token.
+    while tokens and tokens[0].is_punct:
+        tokens.pop(0)
+
+    # Strip one or more leading prepositions. The lexical set is a fallback for
+    # occasional tagging errors in multilingual subtitle text.
+    while tokens:
+        first = tokens[0]
+        first_key = first.text.casefold().strip(".,;:!?¡¿()[]{}\"'“”‘’")
+        first_pos = str(getattr(first, "pos_", "") or "").upper()
+        if first_pos == "ADP" or first_key in LEADING_LOCATION_PREPOSITIONS:
+            tokens.pop(0)
+            while tokens and tokens[0].is_punct:
+                tokens.pop(0)
+            continue
+        break
+
+    retained = [
+        token
+        for token in tokens
+        if str(getattr(token, "pos_", "") or "").upper() not in LOCATION_VERB_POS
+    ]
+
+    # A verb removed from the beginning may expose a preposition (for example,
+    # "visitó en Madrid"). Strip that newly exposed leading preposition too.
+    while retained:
+        while retained and retained[0].is_punct:
+            retained.pop(0)
+        if not retained:
+            break
+        first = retained[0]
+        first_key = first.text.casefold().strip(".,;:!?¡¿()[]{}\"'“”‘’")
+        first_pos = str(getattr(first, "pos_", "") or "").upper()
+        if first_pos == "ADP" or first_key in LEADING_LOCATION_PREPOSITIONS:
+            retained.pop(0)
+            continue
+        break
+
+    # Remove punctuation stranded at either edge after cleanup.
+    while retained and retained[0].is_punct:
+        retained.pop(0)
+    while retained and retained[-1].is_punct:
+        retained.pop()
+
+    if not any(not token.is_punct for token in retained):
+        return ""
+
+    reconstructed = "".join(
+        getattr(token, "text_with_ws", token.text + " ") for token in retained
+    ).strip()
+    reconstructed = re.sub(r"\s+([,.;:!?])", r"\1", reconstructed)
+    reconstructed = re.sub(r"([\(\[\{])\s+", r"\1", reconstructed)
+    reconstructed = re.sub(r"\s+([\)\]\}])", r"\1", reconstructed)
+    return clean_entity_value(reconstructed)
+
+
 def should_keep_entity(entity: Any, label: str, entity_text: str) -> bool:
     """Apply label-aware precision rules to a spaCy entity.
 
@@ -878,7 +972,22 @@ def extract_raw_entities_batch(texts: Iterable[str], nlp: Any) -> list[EntityBun
 
         for entity in doc.ents:
             label = str(entity.label_).upper()
-            entity_text = clean_entity_value(entity.text)
+            original_entity_text = clean_entity_value(entity.text)
+            if not original_entity_text:
+                continue
+
+            organization_is_place = label in ORGANIZATION_LABELS and (
+                DIOCESE_PATTERN.match(original_entity_text)
+                or ADMINISTRATIVE_PLACE_PATTERN.match(original_entity_text)
+            )
+            is_place_entity = label in LOCATION_LABELS or organization_is_place
+
+            # Place spans receive additional cleanup: initial prepositions are
+            # removed and verb/AUX tokens are omitted before storage, resolution,
+            # session propagation, and TXT generation.
+            entity_text = (
+                clean_place_entity(entity) if is_place_entity else original_entity_text
+            )
             if not entity_text:
                 continue
 
@@ -891,15 +1000,10 @@ def extract_raw_entities_batch(texts: Iterable[str], nlp: Any) -> list[EntityBun
                 formatted_person = format_person_name(entity_text)
                 if formatted_person:
                     people.append(formatted_person)
-            elif label in LOCATION_LABELS:
+            elif is_place_entity:
                 places.append(entity_text)
             elif label in ORGANIZATION_LABELS:
-                # Dioceses and explicitly named administrative units are geographic
-                # entities for this workflow even when a model labels them ORG.
-                if DIOCESE_PATTERN.match(entity_text) or ADMINISTRATIVE_PLACE_PATTERN.match(entity_text):
-                    places.append(entity_text)
-                else:
-                    organizations.append(entity_text)
+                organizations.append(entity_text)
 
         results.append(
             EntityBundle(
@@ -920,7 +1024,7 @@ def get_geocode_rate_limiter() -> Any:
     from geopy.geocoders import Nominatim
 
     geocoder = Nominatim(
-        user_agent="srt-to-tsv-spacy-ner/5.0",
+        user_agent="srt-to-tsv-spacy-ner/7.0",
         timeout=12,
     )
     return RateLimiter(
